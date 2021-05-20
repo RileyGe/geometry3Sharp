@@ -2,9 +2,7 @@
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Text;
 using System.Runtime.InteropServices;
-using System.Threading;
 
 namespace g3
 {
@@ -12,7 +10,7 @@ namespace g3
     /// Read ASCII/Binary STL file and produce set of meshes.
     /// 
     /// Since STL is just a list of disconnected triangles, by default we try to
-    /// merge vertices together. Use .RebuildStrategy to disable this and/or configure
+    /// merge vertices together. Use .WeldStrategy to disable this and/or configure
     /// which algorithm is used. If you are using via StandardMeshReader, you can add
     /// .StrategyFlag to ReadOptions.CustomFlags to set this flag.
     /// 
@@ -29,27 +27,15 @@ namespace g3
     /// </summary>
     public class STLReader : IMeshReader
     {
-
-        public enum Strategy
-        {
-            NoProcessing = 0,           // return triangle soup
-            IdenticalVertexWeld = 1,    // merge identical vertices. Logically sensible but doesn't always work on ASCII STL.
-            TolerantVertexWeld = 2,     // merge vertices within .WeldTolerance
-
-            AutoBestResult = 3          // try identical weld first, if there are holes then try tolerant weld, and return "best" result
-                                        // ("best" is not well-defined...)
-        }
-
         /// <summary>
         /// Which algorithm is used to try to reconstruct mesh topology from STL triangle soup
         /// </summary>
-        public Strategy RebuildStrategy = Strategy.AutoBestResult;
+        public VertexWelderStrategies WeldStrategy { get; set; } = VertexWelderStrategies.AutoBestResult;
 
         /// <summary>
         /// Vertices within this distance are considered "the same" by welding strategies.
         /// </summary>
-        public double WeldTolerance = MathUtil.ZeroTolerancef;
-
+        public double WeldTolerance { get; set; } = MathUtil.ZeroTolerancef;
 
         /// <summary>
         /// Binary STL supports per-triangle integer attribute, which is often used
@@ -79,11 +65,10 @@ namespace g3
         /// <summary> ReadOptions.CustomFlags flag for configuring .WantPerTriAttribs </summary>
         public const string PerTriAttribFlag = "-want-tri-attrib";
 
-
         void ParseArguments(CommandArgumentSet args)
         {
             if ( args.Integers.ContainsKey(StrategyFlag) ) {
-                RebuildStrategy = (Strategy)args.Integers[StrategyFlag];
+                WeldStrategy = (VertexWelderStrategies)args.Integers[StrategyFlag];
             }
             if (args.Flags.ContainsKey(PerTriAttribFlag)) {
                 WantPerTriAttribs = true;
@@ -108,64 +93,63 @@ namespace g3
             Objects.Last().Vertices.Append(x, y, z);
         }
 
-
-
-        // entire data block for stl triangle, that we can directly convert to byte[]
-        [StructLayout(LayoutKind.Sequential, Pack=1)]
-        struct stl_triangle
-        {
-            public float nx, ny, nz;
-            public float ax, ay, az;
-            public float bx, by, bz;
-            public float cx, cy, cz;
-            public short attrib;
-        }
-
-
         public IOReadResult Read(BinaryReader reader, ReadOptions options, IMeshBuilder builder)
         {
             if ( options.CustomFlags != null )
                 ParseArguments(options.CustomFlags);
 
-            /*byte[] header = */reader.ReadBytes(80);
+            // Advance past header
+            reader.ReadBytes(80);
+
             int totalTris = reader.ReadInt32();
 
             Objects = new List<STLSolid>();
             Objects.Add(new STLSolid());
 
             int tri_size = 50;      // bytes
-            IntPtr bufptr = Marshal.AllocHGlobal(tri_size);
-            stl_triangle tmp = new stl_triangle();
-            Type tri_type = tmp.GetType();
 
-            DVector<short> tri_attribs = new DVector<short>();
+            try
+            {
+                int nChunkSize = 1024;
+                float ax, ay, az, bx, by, bz, cx, cy, cz;
+                int nChunks = totalTris / nChunkSize;
 
-            try {
-                for (int i = 0; i < totalTris; ++i) {
-                    byte[] tri_bytes = reader.ReadBytes(50);
-                    if (tri_bytes.Length < 50)
-                        break;
+                byte[] tri_bytes;
+                int tri_start;
 
-                    Marshal.Copy(tri_bytes, 0, bufptr, tri_size);
-                    stl_triangle tri = (stl_triangle)Marshal.PtrToStructure(bufptr, tri_type);
+                for (int i = 0; i < nChunks; ++i)
+                {
+                    tri_bytes = reader.ReadBytes(tri_size * nChunkSize);
 
-                    append_vertex(tri.ax, tri.ay, tri.az);
-                    append_vertex(tri.bx, tri.by, tri.bz);
-                    append_vertex(tri.cx, tri.cy, tri.cz);
-                    tri_attribs.Add(tri.attrib);
+                    for (int k = 0; k < nChunkSize; ++k)
+                    {
+                        tri_start = tri_size * k;
+
+                        ax = BitConverter.ToSingle(tri_bytes, tri_start + 12);
+                        ay = BitConverter.ToSingle(tri_bytes, tri_start + 16);
+                        az = BitConverter.ToSingle(tri_bytes, tri_start + 20);
+
+                        bx = BitConverter.ToSingle(tri_bytes, tri_start + 24);
+                        by = BitConverter.ToSingle(tri_bytes, tri_start + 28);
+                        bz = BitConverter.ToSingle(tri_bytes, tri_start + 32);
+
+                        cx = BitConverter.ToSingle(tri_bytes, tri_start + 36);
+                        cy = BitConverter.ToSingle(tri_bytes, tri_start + 40);
+                        cz = BitConverter.ToSingle(tri_bytes, tri_start + 44);
+
+                        append_vertex(ax, ay, az);
+                        append_vertex(bx, by, bz);
+                        append_vertex(cx, cy, cz);
+                    }
                 }
-
-            } catch (Exception e) {
+            }
+            catch (Exception e)
+            {
                 return new IOReadResult(IOCode.GenericReaderError, "exception: " + e.Message);
             }
 
-            Marshal.FreeHGlobal(bufptr);
-
-            if (Objects.Count == 1)
-                Objects[0].TriAttribs = tri_attribs;
-
             foreach (STLSolid solid in Objects)
-                BuildMesh(solid, builder);
+                 BuildMesh(solid, builder);
 
             return new IOReadResult(IOCode.Ok, "");
         }
@@ -255,223 +239,13 @@ namespace g3
             return new IOReadResult(IOCode.Ok, "");
         }
 
-
-
-
-
-
         protected virtual void BuildMesh(STLSolid solid, IMeshBuilder builder)
         {
-            if (RebuildStrategy == Strategy.AutoBestResult) {
-                DMesh3 result = BuildMesh_Auto(solid);
-                builder.AppendNewMesh(result);
-
-            } else if (RebuildStrategy == Strategy.IdenticalVertexWeld) {
-                DMesh3 result = BuildMesh_IdenticalWeld(solid);
-                builder.AppendNewMesh(result);
-            } else if (RebuildStrategy == Strategy.TolerantVertexWeld) {
-                DMesh3 result = BuildMesh_TolerantWeld(solid, WeldTolerance);
-                builder.AppendNewMesh(result);
-            } else {
-                BuildMesh_NoMerge(solid, builder);
-            }
+            var vertexWelder = VertexWelderFactory.Create(WeldStrategy);
+            builder.AppendNewMesh(vertexWelder.Weld(solid.Vertices));
 
             if (WantPerTriAttribs && solid.TriAttribs != null && builder.SupportsMetaData)
                 builder.AppendMetaData(PerTriAttribMetadataName, solid.TriAttribs);
         }
-
-
-        protected virtual void BuildMesh_NoMerge(STLSolid solid, IMeshBuilder builder)
-        {
-            /*int meshID = */builder.AppendNewMesh(false, false, false, false);
-
-            DVectorArray3f vertices = solid.Vertices;
-            int nTris = vertices.Count / 3;
-            for ( int ti = 0; ti < nTris; ++ti ) {
-                Vector3f va = vertices[3 * ti];
-                int a = builder.AppendVertex(va.x, va.y, va.z);
-                Vector3f vb = vertices[3 * ti + 1];
-                int b = builder.AppendVertex(vb.x, vb.y, vb.z);
-                Vector3f vc = vertices[3 * ti + 2];
-                int c = builder.AppendVertex(vc.x, vc.y, vc.z);
-
-                builder.AppendTriangle(a, b, c);
-            }
-        }
-
-
-
-        protected virtual DMesh3 BuildMesh_Auto(STLSolid solid)
-        {
-            DMesh3 fastWeldMesh = BuildMesh_IdenticalWeld(solid);
-            int fastWeldMesh_bdryCount;
-            if (check_for_cracks(fastWeldMesh, out fastWeldMesh_bdryCount, WeldTolerance)) {
-                DMesh3 tolWeldMesh = BuildMesh_TolerantWeld(solid, WeldTolerance);
-                int tolWeldMesh_bdryCount = count_boundary_edges(tolWeldMesh);
-
-                if (tolWeldMesh_bdryCount < fastWeldMesh_bdryCount)
-                    return tolWeldMesh;
-                else
-                    return fastWeldMesh;
-
-            }
-
-            return fastWeldMesh;
-        }
-
-
-
-
-        protected int count_boundary_edges(DMesh3 mesh) {
-            int boundary_edge_count = 0;
-            foreach (int eid in mesh.BoundaryEdgeIndices()) {
-                boundary_edge_count++;
-            }
-            return boundary_edge_count;
-        }
-
-
-
-        protected bool check_for_cracks(DMesh3 mesh, out int boundary_edge_count, double crack_tol = MathUtil.ZeroTolerancef)
-        {
-            boundary_edge_count = 0;
-            MeshVertexSelection boundary_verts = new MeshVertexSelection(mesh);
-            foreach ( int eid in mesh.BoundaryEdgeIndices() ) {
-                Index2i ev = mesh.GetEdgeV(eid);
-                boundary_verts.Select(ev.a); boundary_verts.Select(ev.b);
-                boundary_edge_count++;
-            }
-            if (boundary_verts.Count == 0)
-                return false;
-            
-
-            AxisAlignedBox3d bounds = mesh.CachedBounds;
-            PointHashGrid3d<int> borderV = new PointHashGrid3d<int>(bounds.MaxDim / 128, -1);
-            foreach ( int vid in boundary_verts ) {
-                Vector3d v = mesh.GetVertex(vid);
-                var result = borderV.FindNearestInRadius(v, crack_tol, (existing_vid) => {
-                    return v.Distance(mesh.GetVertex(existing_vid));
-                });
-                if (result.Key != -1)
-                    return true;            // we found a crack vertex!
-                borderV.InsertPoint(vid, v);
-            }
-
-            // found no cracks
-            return false;
-        }
-
-
-
-
-        protected virtual DMesh3 BuildMesh_IdenticalWeld(STLSolid solid)
-        {
-            DMesh3Builder builder = new DMesh3Builder();
-            builder.AppendNewMesh(false, false, false, false);
-
-            DVectorArray3f vertices = solid.Vertices;
-            int N = vertices.Count;
-            int[] mapV = new int[N];
-
-            Dictionary<Vector3f, int> uniqueV = new Dictionary<Vector3f, int>();
-            for (int vi = 0; vi < N; ++vi) {
-                Vector3f v = vertices[vi];
-                int existing_idx;
-                if (uniqueV.TryGetValue(v, out existing_idx)) {
-                    mapV[vi] = existing_idx;
-                } else {
-                    int vid = builder.AppendVertex(v.x, v.y, v.z);
-                    uniqueV[v] = vid;
-                    mapV[vi] = vid;
-                }
-            }
-
-            append_mapped_triangles(solid, builder, mapV);
-            return builder.Meshes[0];
-        }
-
-
-
-
-        protected virtual DMesh3 BuildMesh_TolerantWeld(STLSolid solid, double weld_tolerance)
-        {
-            DMesh3Builder builder = new DMesh3Builder();
-            builder.AppendNewMesh(false, false, false, false);
-
-            DVectorArray3f vertices = solid.Vertices;
-            int N = vertices.Count;
-            int[] mapV = new int[N];
-
-
-            AxisAlignedBox3d bounds = AxisAlignedBox3d.Empty;
-            for (int i = 0; i < N; ++i)
-                bounds.Contain(vertices[i]);
-
-            // [RMS] because we are only searching within tiny radius, there is really no downside to
-            // using lots of bins here, except memory usage. If we don't, and the mesh has a ton of triangles
-            // very close together (happens all the time on big meshes!), then this step can start
-            // to take an *extremely* long time!
-            int num_bins = 256;
-            if (N > 100000)   num_bins = 512;
-            if (N > 1000000)  num_bins = 1024;
-            if (N > 2000000) num_bins = 2048;
-            if (N > 5000000) num_bins = 4096;
-
-            PointHashGrid3d<int> uniqueV = new PointHashGrid3d<int>(bounds.MaxDim / (float)num_bins, -1);
-            Vector3f[] pos = new Vector3f[N];
-            for (int vi = 0; vi < N; ++vi) {
-                Vector3f v = vertices[vi];
-
-                var pair = uniqueV.FindNearestInRadius(v, weld_tolerance, (vid) => {
-                    return v.Distance(pos[vid]);
-                });
-                if (pair.Key == -1) {
-                    int vid = builder.AppendVertex(v.x, v.y, v.z);
-                    uniqueV.InsertPoint(vid, v);
-                    mapV[vi] = vid;
-                    pos[vid] = v;
-                } else {
-                    mapV[vi] = pair.Key;
-                }
-            }
-
-            append_mapped_triangles(solid, builder, mapV);
-            return builder.Meshes[0];
-        }
-
-
-
-        void append_mapped_triangles(STLSolid solid, DMesh3Builder builder, int[] mapV)
-        {
-            int nTris = solid.Vertices.Count / 3;
-            for (int ti = 0; ti < nTris; ++ti) {
-                int a = mapV[3 * ti];
-                int b = mapV[3 * ti + 1];
-                int c = mapV[3 * ti + 2];
-                if (a == b || a == c || b == c)     // don't try to add degenerate triangles
-                    continue;
-                builder.AppendTriangle(a, b, c);
-            }
-        }
-
-
-
-
-
-        private void emit_warning(string sMessage)
-        {
-            string sPrefix = sMessage.Substring(0, 15);
-            int nCount = warningCount.ContainsKey(sPrefix) ? warningCount[sPrefix] : 0;
-            nCount++; warningCount[sPrefix] = nCount;
-            if (nCount > 10)
-                return;
-            else if (nCount == 10)
-                sMessage += " (additional message surpressed)";
-
-            var e = warningEvent;
-            if (e != null)
-                e(sMessage, null);
-        }
-
     }
 }
