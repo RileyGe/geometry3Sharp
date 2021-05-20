@@ -2,21 +2,20 @@
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Runtime.InteropServices;
 
 namespace g3
 {
     /// <summary>
     /// Read ASCII/Binary STL file and produce set of meshes.
-    /// 
+    ///
     /// Since STL is just a list of disconnected triangles, by default we try to
     /// merge vertices together. Use .WeldStrategy to disable this and/or configure
     /// which algorithm is used. If you are using via StandardMeshReader, you can add
     /// .StrategyFlag to ReadOptions.CustomFlags to set this flag.
-    /// 
+    ///
     /// TODO: document welding strategies. There is no "best" one, they all fail
     /// in some cases, because STL is a stupid and horrible format.
-    /// 
+    ///
     /// STL Binary supports a per-triangle short-int that is usually used to specify color.
     /// However since we do not support per-triangle color in DMesh3, this color
     /// cannot be directly used. Instead of hardcoding behavior, we return the list of shorts
@@ -27,6 +26,36 @@ namespace g3
     /// </summary>
     public class STLReader : IMeshReader
     {
+        protected class STLSolid
+        {
+            public string Name;
+            public DVector<short> TriAttribs = null;
+            public DVectorArray3f Vertices = new DVectorArray3f();
+        }
+
+        /// <summary> ReadOptions.CustomFlags flag for configuring .WantPerTriAttribs </summary>
+        public const string PerTriAttribFlag = "-want-tri-attrib";
+
+        /// <summary> ReadOptions.CustomFlags flag for configuring .RebuildStrategy </summary>
+        public const string StrategyFlag = "-stl-weld-strategy";
+
+        /// <summary>
+        /// name argument passed to IMeshBuilder.AppendMetaData
+        /// </summary>
+        public static string PerTriAttribMetadataName = "tri_attrib";
+
+        /// <summary>
+        /// Binary STL supports per-triangle integer attribute, which is often used
+        /// to store face colors. If this flag is true, we will attach these face
+        /// colors to the returned mesh via IMeshBuilder.AppendMetaData
+        /// </summary>
+        public bool WantPerTriAttribs = false;
+
+        private List<STLSolid> Objects;
+
+        //int nWarningLevel = 0;      // 0 == no diagnostics, 1 == basic, 2 == crazy
+        private Dictionary<string, int> warningCount = new Dictionary<string, int>();
+
         /// <summary>
         /// Which algorithm is used to try to reconstruct mesh topology from STL triangle soup
         /// </summary>
@@ -37,65 +66,12 @@ namespace g3
         /// </summary>
         public double WeldTolerance { get; set; } = MathUtil.ZeroTolerancef;
 
-        /// <summary>
-        /// Binary STL supports per-triangle integer attribute, which is often used
-        /// to store face colors. If this flag is true, we will attach these face
-        /// colors to the returned mesh via IMeshBuilder.AppendMetaData
-        /// </summary>
-        public bool WantPerTriAttribs = false;
-
-        /// <summary>
-        /// name argument passed to IMeshBuilder.AppendMetaData
-        /// </summary>
-        public static string PerTriAttribMetadataName = "tri_attrib";
-
-
         /// <summary> connect to this event to get warning messages </summary>
 		public event ParsingMessagesHandler warningEvent;
 
-
-        //int nWarningLevel = 0;      // 0 == no diagnostics, 1 == basic, 2 == crazy
-        Dictionary<string, int> warningCount = new Dictionary<string, int>();
-
-
-
-        /// <summary> ReadOptions.CustomFlags flag for configuring .RebuildStrategy </summary>
-        public const string StrategyFlag = "-stl-weld-strategy";
-
-        /// <summary> ReadOptions.CustomFlags flag for configuring .WantPerTriAttribs </summary>
-        public const string PerTriAttribFlag = "-want-tri-attrib";
-
-        void ParseArguments(CommandArgumentSet args)
-        {
-            if ( args.Integers.ContainsKey(StrategyFlag) ) {
-                WeldStrategy = (VertexWelderStrategies)args.Integers[StrategyFlag];
-            }
-            if (args.Flags.ContainsKey(PerTriAttribFlag)) {
-                WantPerTriAttribs = true;
-            }
-        }
-
-
-
-
-        protected class STLSolid
-        {
-            public string Name;
-            public DVectorArray3f Vertices = new DVectorArray3f();
-            public DVector<short> TriAttribs = null;
-        }
-
-
-        List<STLSolid> Objects;
-
-        void append_vertex(float x, float y, float z)
-        {
-            Objects.Last().Vertices.Append(x, y, z);
-        }
-
         public IOReadResult Read(BinaryReader reader, ReadOptions options, IMeshBuilder builder)
         {
-            if ( options.CustomFlags != null )
+            if (options.CustomFlags != null)
                 ParseArguments(options.CustomFlags);
 
             // Advance past header
@@ -137,9 +113,9 @@ namespace g3
                         cy = BitConverter.ToSingle(tri_bytes, tri_start + 40);
                         cz = BitConverter.ToSingle(tri_bytes, tri_start + 44);
 
-                        append_vertex(ax, ay, az);
-                        append_vertex(bx, by, bz);
-                        append_vertex(cx, cy, cz);
+                        AppendVertex(ax, ay, az);
+                        AppendVertex(bx, by, bz);
+                        AppendVertex(cx, cy, cz);
                     }
                 }
             }
@@ -149,17 +125,14 @@ namespace g3
             }
 
             foreach (STLSolid solid in Objects)
-                 BuildMesh(solid, builder);
+                BuildMesh(solid, builder);
 
             return new IOReadResult(IOCode.Ok, "");
         }
 
-
-
-
         public IOReadResult Read(TextReader reader, ReadOptions options, IMeshBuilder builder)
         {
-            if ( options.CustomFlags != null )
+            if (options.CustomFlags != null)
                 ParseArguments(options.CustomFlags);
 
             // format is just this, with facet repeated N times:
@@ -181,43 +154,45 @@ namespace g3
             Objects = new List<STLSolid>();
 
             int nLines = 0;
-            while (reader.Peek() >= 0) {
-
+            while (reader.Peek() >= 0)
+            {
                 string line = reader.ReadLine();
                 nLines++;
-                string[] tokens = line.Split( (char[])null , StringSplitOptions.RemoveEmptyEntries);
+                string[] tokens = line.Split((char[])null, StringSplitOptions.RemoveEmptyEntries);
                 if (tokens.Length == 0)
                     continue;
 
-                if (tokens[0].Equals("vertex", StringComparison.OrdinalIgnoreCase)) {
+                if (tokens[0].Equals("vertex", StringComparison.OrdinalIgnoreCase))
+                {
                     float x = (tokens.Length > 1) ? Single.Parse(tokens[1]) : 0;
                     float y = (tokens.Length > 2) ? Single.Parse(tokens[2]) : 0;
                     float z = (tokens.Length > 3) ? Single.Parse(tokens[3]) : 0;
-                    append_vertex(x, y, z);
+                    AppendVertex(x, y, z);
 
-                // [RMS] we don't really care about these lines...
-                //} else if (tokens[0].Equals("outer", StringComparison.OrdinalIgnoreCase)) {
-                //    in_loop = true;
-                //    vertices_in_loop = 0;
+                    // [RMS] we don't really care about these lines...
+                    //} else if (tokens[0].Equals("outer", StringComparison.OrdinalIgnoreCase)) {
+                    //    in_loop = true;
+                    //    vertices_in_loop = 0;
 
-                //} else if (tokens[0].Equals("endloop", StringComparison.OrdinalIgnoreCase)) {
-                //    in_loop = false;
-                        
-
-                } else if (tokens[0].Equals("facet", StringComparison.OrdinalIgnoreCase)) {
-                    if ( in_solid == false ) {      // handle bad STL
+                    //} else if (tokens[0].Equals("endloop", StringComparison.OrdinalIgnoreCase)) {
+                    //    in_loop = false;
+                }
+                else if (tokens[0].Equals("facet", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (in_solid == false)
+                    {      // handle bad STL
                         Objects.Add(new STLSolid() { Name = "unknown_solid" });
                         in_solid = true;
                     }
                     //in_facet = true;
                     // ignore facet normal
 
-                // [RMS] also don't really need to do anything for this one
-                //} else if (tokens[0].Equals("endfacet", StringComparison.OrdinalIgnoreCase)) {
+                    // [RMS] also don't really need to do anything for this one
+                    //} else if (tokens[0].Equals("endfacet", StringComparison.OrdinalIgnoreCase)) {
                     //in_facet = false;
-
-
-                } else if (tokens[0].Equals("solid", StringComparison.OrdinalIgnoreCase)) {
+                }
+                else if (tokens[0].Equals("solid", StringComparison.OrdinalIgnoreCase))
+                {
                     STLSolid newObj = new STLSolid();
                     if (tokens.Length == 2)
                         newObj.Name = tokens[1];
@@ -225,9 +200,9 @@ namespace g3
                         newObj.Name = "object_" + Objects.Count;
                     Objects.Add(newObj);
                     in_solid = true;
-
-
-                } else if (tokens[0].Equals("endsolid", StringComparison.OrdinalIgnoreCase)) {
+                }
+                else if (tokens[0].Equals("endsolid", StringComparison.OrdinalIgnoreCase))
+                {
                     // do nothing, done object
                     in_solid = false;
                 }
@@ -246,6 +221,23 @@ namespace g3
 
             if (WantPerTriAttribs && solid.TriAttribs != null && builder.SupportsMetaData)
                 builder.AppendMetaData(PerTriAttribMetadataName, solid.TriAttribs);
+        }
+
+        private void AppendVertex(float x, float y, float z)
+        {
+            Objects.Last().Vertices.Append(x, y, z);
+        }
+
+        private void ParseArguments(CommandArgumentSet args)
+        {
+            if (args.Integers.ContainsKey(StrategyFlag))
+            {
+                WeldStrategy = (VertexWelderStrategies)args.Integers[StrategyFlag];
+            }
+            if (args.Flags.ContainsKey(PerTriAttribFlag))
+            {
+                WantPerTriAttribs = true;
+            }
         }
     }
 }
